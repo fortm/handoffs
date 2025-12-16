@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Gesture Recognition</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; }
+        #container { position: relative; display: inline-block; }
+        #video { width: 640px; height: 480px; border: 1px solid #ccc; transform: rotateY(180deg); } /* Mirror video */
+        #canvas { position: absolute; top: 0; left: 0; width: 640px; height: 480px; pointer-events: none; transform: rotateY(180deg); } /* Mirror canvas */
+        #gestureResult { font-size: 24px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+<h1>Hand Gesture Recognition</h1>
+<div id="container">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+</div>
+<div id="gestureResult">No gesture detected</div>
+
+<script type="module">
+    import { FilesetResolver, GestureRecognizer, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs";
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const gestureResult = document.getElementById('gestureResult');
+
+    // History and states
+    const HISTORY_LENGTH = 15;
+    const DEBOUNCE_FRAMES = 3;  // Lowered for responsiveness
+    const HOLD_FRAMES = 30;  // Hold dynamic display for ~1s
+    const RESET_FRAMES = 10;  // No motion for this many frames to reset
+    const handHistories = [[], []];
+    const handStaticStates = [{ gesture: '', count: 0 }, { gesture: '', count: 0 }];
+    const handDynamicStates = [{ gesture: '', count: 0, hold: 0, noMotion: 0 }, { gesture: '', count: 0, hold: 0, noMotion: 0 }];
+
+    // Thresholds
+    const SWIPE_THRESHOLD = 0.1;
+    const WAVE_THRESHOLD = 0.03;
+    const WAVE_REVERSALS = 2;
+    const MOTION_END_THRESHOLD = 0.005;  // Relaxed for detection
+
+    async function setupWebcam() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            video.srcObject = stream;
+            video.addEventListener('loadeddata', () => {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                initRecognizer();
+            });
+        } catch (err) {
+            console.error('Webcam error:', err);
+            alert('Allow webcam access.');
+        }
+    }
+
+    let recognizer;
+    async function initRecognizer() {
+        const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+        );
+        recognizer = await GestureRecognizer.createFromOptions(vision, {
+            baseOptions: {
+                modelAssetPath: "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+                delegate: "CPU"
+            },
+            runningMode: "VIDEO",
+            numHands: 2,
+            minHandDetectionConfidence: 0.4,
+            minHandPresenceConfidence: 0.4,
+            minTrackingConfidence: 0.4
+        });
+        renderLoop();
+    }
+
+    let lastTime = -1;
+    function renderLoop() {
+        if (video.currentTime !== lastTime) {
+            const nowInMs = Date.now();
+            const results = recognizer.recognizeForVideo(video, nowInMs);
+            processResults(results);
+            lastTime = video.currentTime;
+        }
+        requestAnimationFrame(renderLoop);
+    }
+
+    function processResults(results) {
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const drawingUtils = new DrawingUtils(ctx);
+        let displayTexts = [];
+
+        if (results.landmarks && results.landmarks.length > 0) {
+            results.landmarks.forEach((landmarks, handIndex) => {
+                // Draw
+                drawingUtils.drawConnectors(landmarks, GestureRecognizer.HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 5 });
+                drawingUtils.drawLandmarks(landmarks, { color: '#FF0000', lineWidth: 2 });
+
+                // Handedness
+                const handedness = results.handednesses[handIndex][0].displayName || 'Unknown';
+
+                // History update
+                const wrist = landmarks[0];
+                handHistories[handIndex].push({ x: wrist.x, y: wrist.y });
+                if (handHistories[handIndex].length > HISTORY_LENGTH) handHistories[handIndex].shift();
+
+                // Static
+                let staticGesture = 'None';
+                if (results.gestures && results.gestures[handIndex]) {
+                    const gesture = results.gestures[handIndex][0];
+                    if (gesture.score > 0.4) {
+                        staticGesture = `${gesture.categoryName} (Confidence: ${gesture.score.toFixed(2)})`;
+                    }
+                }
+                if (staticGesture === handStaticStates[handIndex].gesture) {
+                    handStaticStates[handIndex].count++;
+                } else {
+                    handStaticStates[handIndex] = { gesture: staticGesture, count: 1 };
+                }
+
+                // Dynamic
+                let dynamicGesture = handDynamicStates[handIndex].gesture;  // Preserve if holding
+                if (handHistories[handIndex].length === HISTORY_LENGTH) {
+                    const history = handHistories[handIndex];
+                    const deltaX = history[HISTORY_LENGTH - 1].x - history[0].x;
+                    const deltaY = history[HISTORY_LENGTH - 1].y - history[0].y;
+                    const recentDeltaX = history[HISTORY_LENGTH - 1].x - history[HISTORY_LENGTH - 2].x;
+                    const recentDeltaY = history[HISTORY_LENGTH - 1].y - history[HISTORY_LENGTH - 2].y;
+                    const isMotionEnded = Math.abs(recentDeltaX) < MOTION_END_THRESHOLD && Math.abs(recentDeltaY) < MOTION_END_THRESHOLD;
+
+                    if (isMotionEnded && !dynamicGesture) {  // Detect only if not already set
+                        // Swipe
+                        const avgDeltaY = Math.abs(history.reduce((sum, p) => sum + p.y, 0) / HISTORY_LENGTH - wrist.y);
+                        if (Math.abs(deltaX) > SWIPE_THRESHOLD && avgDeltaY < 0.05) {
+                            dynamicGesture = deltaX > 0 ? 'Swipe Right' : 'Swipe Left';
+                            console.log(`Detected ${dynamicGesture} on ${handedness} Hand (deltaX=${deltaX.toFixed(3)})`);
+                        }
+
+                        // Wave
+                        let reversals = 0;
+                        let lastDirection = 0;
+                        for (let i = 1; i < HISTORY_LENGTH; i++) {
+                            const dy = history[i].y - history[i - 1].y;
+                            const direction = dy > WAVE_THRESHOLD ? 1 : (dy < -WAVE_THRESHOLD ? -1 : 0);
+                            if (direction !== 0 && direction !== lastDirection) {
+                                reversals++;
+                                lastDirection = direction;
+                            }
+                        }
+                        if (reversals >= WAVE_REVERSALS) {
+                            dynamicGesture = 'Waving';
+                            console.log(`Detected ${dynamicGesture} on ${handedness} Hand (reversals=${reversals})`);
+                        }
+                    }
+
+                    // Update state
+                    if (dynamicGesture === handDynamicStates[handIndex].gesture) {
+                        handDynamicStates[handIndex].count++;
+                        handDynamicStates[handIndex].hold = HOLD_FRAMES;  // Reset hold timer on confirmation
+                        handDynamicStates[handIndex].noMotion = 0;
+                    } else if (dynamicGesture) {
+                        handDynamicStates[handIndex] = { gesture: dynamicGesture, count: 1, hold: HOLD_FRAMES, noMotion: 0 };
+                    } else {
+                        handDynamicStates[handIndex].noMotion++;
+                        if (handDynamicStates[handIndex].hold > 0) handDynamicStates[handIndex].hold--;
+                        if (handDynamicStates[handIndex].hold <= 0 && handDynamicStates[handIndex].noMotion > RESET_FRAMES) {
+                            handDynamicStates[handIndex] = { gesture: '', count: 0, hold: 0, noMotion: 0 };
+                        }
+                    }
+                }
+
+                // Build text
+                let handText = `${handedness} Hand: `;
+                if (handStaticStates[handIndex].count >= DEBOUNCE_FRAMES && handStaticStates[handIndex].gesture !== 'None') {
+                    handText += `Static - ${handStaticStates[handIndex].gesture}`;
+                }
+                if (handDynamicStates[handIndex].count >= DEBOUNCE_FRAMES && handDynamicStates[handIndex].gesture) {
+                    handText += `${handStaticStates[handIndex].gesture !== 'None' ? ' | ' : ''}Dynamic - ${handDynamicStates[handIndex].gesture}`;
+                }
+                if (handText !== `${handedness} Hand: `) displayTexts.push(handText);
+            });
+        } else {
+            handHistories.forEach(h => h.length = 0);
+            handStaticStates.forEach(s => s.count = 0);
+            handDynamicStates.forEach(s => {
+                s.count = 0;
+                s.hold = 0;
+                s.noMotion = 0;
+                s.gesture = '';
+            });
+        }
+
+        gestureResult.textContent = displayTexts.length > 0 ? displayTexts.join(' | ') : 'No gesture detected';
+        ctx.restore();
+    }
+
+    setupWebcam();
+</script>
+</body>
+</html>
